@@ -4,11 +4,11 @@ Etapa 2 da entrega do servidor chat multiusuario
 
 Estrutura do Projeto
 .
-├── libtslog.h               # Biblioteca de logging thread-safe
-├── server.c                 # Código do servidor
-├── client.c                 # Código do cliente
-├── Script_teste_server.sh   # Script de teste multiusuário
-└── README.md
+─ libtslog.h               # Biblioteca de logging thread-safe
+─ Servidor.c                 # Código do servidor
+─ Cliente.c                 # Código do cliente
+─ Script_teste_server.sh   # Script de teste multiusuário
+─ README.md
 
 Compilação
 Servidor
