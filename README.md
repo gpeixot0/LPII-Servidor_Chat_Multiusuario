@@ -1,24 +1,60 @@
 # LPII-Servidor_Chat_Multiusuario
-Resumo
-
-Este projeto implementa um servidor de chat concorrente utilizando sockets TCP e threads. O sistema permite que múltiplos clientes se conectem simultaneamente, enviem mensagens e recebam mensagens de outros usuários através de broadcast.
+Etapa 2 da entrega do servidor chat multiusuario
 
 
-Arquitetura do Projeto
+Estrutura do Projeto
+.
+├── libtslog.h               # Biblioteca de logging thread-safe
+├── server.c                 # Código do servidor
+├── client.c                 # Código do cliente
+├── Script_teste_server.sh   # Script de teste multiusuário
+└── README.md
 
-O sistema é dividido em headers principais:
+Compilação
+Servidor
+gcc Servidor.c -o server -pthread
 
-libtslog.h:
-  Biblioteca de logging thread-safe. Define níveis de log (DEBUG, INFO, WARN, ERROR) e funções para registrar mensagens com timestamp, nível de severidade e ID da thread.
+Cliente
+gcc Cliente.c -o client -pthread
 
-server.h:
-  Contém definições e funções relacionadas ao servidor TCP: inicialização do socket, aceitação de clientes e gerenciamento das threads.
+O script Script_teste_server.sh não compila os arquivos, apenas inicia o servidor e múltiplos clientes automaticamente para teste.
 
-client_handler.h:
-  Define a lógica de atendimento de cada cliente conectado ao servidor. Inclui a recepção de mensagens e a retransmissão (broadcast).
+Execução
+Rodar servidor
+./server
 
-client_cli.h:
-  Implementa o cliente em linha de comando (CLI). Responsável por se conectar ao servidor, enviar mensagens e exibir mensagens recebidas.
+Rodar cliente
+./client
 
-chat.h:
-  Define estruturas compartilhadas entre threads para criação do chat, como a lista de clientes e o histórico de mensagens, além da proteção por mutex.
+O cliente solicita o nome de usuário ao conectar.
+Para sair do chat, use o comando /quit.
+
+Teste multiusuário automático
+./Script_Teste_Server.sh
+
+Inicia o servidor e múltiplos clientes simultaneamente.
+Cada cliente envia mensagens pré-definidas e depois executa /quit.
+Logs do servidor são exibidos no terminal em tempo real.
+
+Arquitetura:
+
+Servidor
+
+Escuta conexões TCP na porta 8080.
+Aceita até MAX_CLIENTS (configurável).
+Cada cliente é gerenciado por uma thread própria.
+Faz broadcast de mensagens para todos os clientes conectados.
+Logger thread-safe registra eventos em tempo real.
+
+Cliente
+
+Conecta ao servidor via TCP.
+Thread principal lê a entrada do usuário e envia mensagens.
+Thread separada recebe mensagens do servidor e imprime no terminal.
+Comando /quit encerra o cliente.
+
+Logger (libtslog.h)
+
+Garante thread-safety usando pthread_mutex_t.
+Suporta níveis de log: DEBUG, INFO, WARN e ERROR.
+Usado pelo servidor para registrar conexões, mensagens e erros.
