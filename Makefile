@@ -3,7 +3,7 @@ CFLAGS = -pthread
 
 all: server client
 
-server: serverM.c libtslog.h
+server: Servidor.c libtslog.h
 	$(CC) $(CFLAGS) Servidor.c -o servidor
 
 client: Cliente.c
@@ -11,3 +11,4 @@ client: Cliente.c
 
 clean:
 	rm -f server client
+
