@@ -1,4 +1,4 @@
-// client.c
+// Cliente.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -143,3 +143,4 @@ int main() {
     printf("Cliente encerrado.\n");
     return 0;
 }
+
