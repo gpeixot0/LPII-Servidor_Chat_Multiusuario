@@ -1,4 +1,4 @@
-// server.c 
+// Servidor.c 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -409,3 +409,4 @@ int main() {
     cleanup_server();
     return 0;
 }
+
