@@ -1,0 +1,91 @@
+Diagrama de Sequência — Comunicação TCP Cliente-Servidor padrão
+
+Cliente                                      Servidor
+   |                                              |
+   |--------------------------------------------->|
+   |                socket()                      |   # Criação do socket de escuta no servidor
+   |                                              |
+   |<---------------------------------------------|
+   |             bind() + listen()                |   # Servidor associa porta e começa a escutar
+   |                                              |
+   |--------------------------------------------->|
+   |                socket()                      |   # Cliente cria seu socket local
+   |--------------------------------------------->|
+   |                connect()                     |   # Cliente solicita conexão ao servidor
+   |                                              |
+   |<---------------------------------------------|
+   |             accept()                         |   # Servidor aceita a conexão
+   |                                              |
+   |--------------------------------------------->|
+   |             send("Hello")                    |   # Cliente envia dados (mensagem)
+   |                                              |
+   |<---------------------------------------------|
+   |             recv("Hello")                    |   # Servidor recebe dados
+   |                                              |
+   |--------------------------------------------->|
+   |             send("Resposta")                 |   # Servidor responde
+   |                                              |
+   |<---------------------------------------------|
+   |             recv("Resposta")                 |   # Cliente recebe resposta
+   |                                              |
+   |--------------------------------------------->|
+   |             close()                          |   # Cliente encerra a conexão
+   |                                              |
+   |<---------------------------------------------|
+   |             close()                          |   # Servidor fecha socket do cliente
+   |                                              |
+
+__________________________________________________________________________________________________________________________________________________________
+
+
+Diagrama — Conexão inicial e entrada no chat
+Este mostra o fluxo desde a conexão do cliente até ele ser reconhecido pelo servidor e o broadcaster anunciar sua entrada.
+
+
+Cliente                Servidor (main)           Thread Cliente         ListaClientes          FilaMensagens (Monitor)         Thread Broadcaster
+   |                         |                           |                      |                         |                               |
+   | -----> connect() -----> |                           |                      |                         |                               |
+   |                         | accept() -> cria thread ->|                      |                         |                               |
+   |                         |                           |-> clientlist_add() ->|                         |                               |
+   |                         |                           |                      |                         |                               |
+   | <---- "Digite seu nome" |                           |                      |                         |                               |
+   | ---- nome usuário ----->|                           |                      |                         |                               |
+   |                         |                           |-> LOG_INFO()         |                         |                               |
+   |                         |                           |-> msgqueue_enqueue("--- entrou ---") --------->|                               |
+   |                         |                           |                      |                         |-> msgqueue_dequeue()          |
+   |                         |                           |                      |                         |    -> broadcast para clientes |
+   | <----------------------- Mensagem de entrada ---------<---------------------<--------------------------<                             |
+
+_________________________________________________________________________________________________________________________________________________________
+
+Diagrama — Envio e recebimento de mensagens
+Este mostra o ciclo normal de mensagens enquanto o cliente está no chat.
+
+
+Cliente A               Servidor (Thread A)      FilaMensagens (Monitor)        Thread Broadcaster             Servidor (Thread B)            Cliente B
+   |                           |                           |                             |                               |                              |
+   | ---- "Oi pessoal" ------->|                           |                             |                               |                              |
+   |                           |-> msgqueue_enqueue() ---->|                             |                               |                              |
+   |                           |                           |---> msgqueue_dequeue() ---->|                               |                              |
+   |                           |                           |                             |-> LOG_INFO("Broadcast")       |                              |
+   |                           |                           |                             |-> send() -------------------> |-> recv() ------------------> |
+   |                           |                           |                             |                               |   mostra "[A] Oi pessoal"    |
+
+_________________________________________________________________________________________________________________________________________________________
+
+Diagrama — Saída do cliente e encerramento do servidor
+Esse mostra o comportamento ao sair com /quit e ao encerrar com Ctrl+C.
+
+
+Cliente            Thread Cliente            FilaMensagens (Monitor)        Thread Broadcaster        ListaClientes          Servidor (main)
+   |                     |                           |                            |                         |                       |
+   | ---- "/quit" ------>|                           |                            |                         |                       |
+   |                     |-> msgqueue_enqueue("--- saiu ---") ------------------->|                         |                       |
+   |                     |-> clientlist_remove_by_sock() ------------------------>|                         |                       |
+   |                     |-> pthread_exit()                                       |                         |                       |
+   |                     |                                                        |-> send msg aos outros ->|                       |
+   |                                                                                                        |                       |
+   |                                                                                                        |<------- SIGINT -------|
+   |                                                                                                        |-> msgqueue_shutdown() 
+   |                                                                                                        |-> join(broadcaster)
+   |                                                                                                        |-> cleanup_server()
