@@ -1,4 +1,4 @@
-// server.c
+// server.c 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,287 +6,404 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <semaphore.h>
+#include <errno.h>
 #include "libtslog.h"
 
 #define PORT 8080
 #define MAX_CLIENTS 10
 #define BUFFER_SIZE 1024
+#define MSG_QUEUE_SIZE 128
 
-// Variáveis globais
-int server_fd;
-Logger logger;
-
-// Estrutura para armazenar dados do cliente
+/* Estrutura que representa um cliente */
 typedef struct {
-    int socket;                    // Socket de conexão
-    struct sockaddr_in addr;       // Endereço do cliente
-    pthread_t thread_id;           // ID da thread
-    int active;                    // Se está ativo
-    char username[32];             // Nome do usuário
+    int socket;
+    struct sockaddr_in addr;
+    pthread_t thread_id;
+    char username[32];
+    int active;
 } client_t;
 
-client_t *clients[MAX_CLIENTS];    // Array de clientes conectados
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;  // Protege o array
+/* Monitor que gerencia a lista de clientes conectados */
+typedef struct {
+    client_t *clients[MAX_CLIENTS];
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+} ClientList;
 
-// Remove cliente da lista
-void remove_client(int sock) {
-    pthread_mutex_lock(&clients_mutex);  // Trava para acesso seguro
+/* Monitor que implementa uma fila de mensagens  */
+typedef struct {
+    char *buf[MSG_QUEUE_SIZE];
+    int sender[MSG_QUEUE_SIZE];
+    int head;
+    int tail;
+    pthread_mutex_t mutex;
+    sem_t slots;
+    sem_t items;
+    int shutdown;
+} MessageQueue;
+
+/* VariÃ¡veis globais */
+int server_fd = -1;
+Logger logger;
+ClientList client_list;
+MessageQueue msg_queue;
+sem_t client_slots;
+pthread_t broadcaster_tid;
+
+/* --------------------------
+   FunÃ§Ãµes do ClientList
+   -------------------------- */
+void clientlist_init(ClientList *cl) {
+    memset(cl->clients, 0, sizeof(cl->clients));
+    cl->count = 0;
+    pthread_mutex_init(&cl->mutex, NULL);
+    pthread_cond_init(&cl->cond, NULL);
+}
+
+/* Adiciona um cliente Ã  lista */
+int clientlist_add(ClientList *cl, client_t *cli) {
+    pthread_mutex_lock(&cl->mutex);
+    int added = 0;
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i] && clients[i]->socket == sock) {
-            LOG_INFO(&logger, "Removendo cliente %s (socket %d)", clients[i]->username, sock);
-            close(clients[i]->socket);   // Fecha conexão
-            free(clients[i]);            // Libera memória
-            clients[i] = NULL;           // Marca como vazio
+        if (!cl->clients[i]) {
+            cl->clients[i] = cli;
+            cl->count++;
+            added = 1;
             break;
         }
     }
-    pthread_mutex_unlock(&clients_mutex);  // Destrava
+    if (added) pthread_cond_broadcast(&cl->cond);
+    pthread_mutex_unlock(&cl->mutex);
+    return added;
 }
 
-// Envia mensagem para todos os clientes, exceto o remetente
-void broadcast(const char *msg, int sender_sock) {
-    pthread_mutex_lock(&clients_mutex);
+/* Remove um cliente da lista com base no socket */
+void clientlist_remove_by_sock(ClientList *cl, int sock) {
+    pthread_mutex_lock(&cl->mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i] && clients[i]->socket != sender_sock) {
-            // Envia para cada cliente (ignora erros)
-            send(clients[i]->socket, msg, strlen(msg), 0);
+        if (cl->clients[i] && cl->clients[i]->socket == sock) {
+            client_t *tmp = cl->clients[i];
+            LOG_INFO(&logger, "Removendo cliente %s (socket %d)", tmp->username, sock);
+            close(tmp->socket);
+            free(tmp);
+            cl->clients[i] = NULL;
+            cl->count--;
+            sem_post(&client_slots);
+            break;
         }
     }
-    pthread_mutex_unlock(&clients_mutex);
+    if (cl->count == 0) pthread_cond_broadcast(&cl->cond);
+    pthread_mutex_unlock(&cl->mutex);
 }
 
-// Thread que cuida de cada cliente
+/* Retorna um snapshot dos sockets ativos */
+int *clientlist_snapshot_sockets(ClientList *cl, int *out_count) {
+    pthread_mutex_lock(&cl->mutex);
+    int n = cl->count;
+    int *arr = NULL;
+    if (n > 0) {
+        arr = malloc(sizeof(int) * n);
+        int idx = 0;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (cl->clients[i]) arr[idx++] = cl->clients[i]->socket;
+        }
+    }
+    *out_count = n;
+    pthread_mutex_unlock(&cl->mutex);
+    return arr;
+}
+
+/* Espera atÃ© que nÃ£o existam clientes conectados */
+void clientlist_wait_until_empty(ClientList *cl) {
+    pthread_mutex_lock(&cl->mutex);
+    while (cl->count > 0)
+        pthread_cond_wait(&cl->cond, &cl->mutex);
+    pthread_mutex_unlock(&cl->mutex);
+}
+
+/* --------------------------
+   FunÃ§Ãµes da MessageQueue
+   -------------------------- */
+void msgqueue_init(MessageQueue *q) {
+    q->head = q->tail = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    sem_init(&q->slots, 0, MSG_QUEUE_SIZE);
+    sem_init(&q->items, 0, 0);
+    q->shutdown = 0;
+}
+
+/* Libera recursos da fila */
+void msgqueue_destroy(MessageQueue *q) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->head != q->tail) {
+        free(q->buf[q->head]);
+        q->head = (q->head + 1) % MSG_QUEUE_SIZE;
+    }
+    pthread_mutex_unlock(&q->mutex);
+    pthread_mutex_destroy(&q->mutex);
+    sem_destroy(&q->slots);
+    sem_destroy(&q->items);
+}
+
+/* Insere uma mensagem na fila */
+int msgqueue_enqueue(MessageQueue *q, const char *msg, int sender_sock) {
+    if (q->shutdown) return -1;
+    if (sem_wait(&q->slots) != 0) return -1;
+    pthread_mutex_lock(&q->mutex);
+    if (q->shutdown) {
+        pthread_mutex_unlock(&q->mutex);
+        sem_post(&q->slots);
+        return -1;
+    }
+    char *copy = strdup(msg);
+    q->buf[q->tail] = copy;
+    q->sender[q->tail] = sender_sock;
+    q->tail = (q->tail + 1) % MSG_QUEUE_SIZE;
+    pthread_mutex_unlock(&q->mutex);
+    sem_post(&q->items);
+    return 0;
+}
+
+/* Remove uma mensagem da fila */
+int msgqueue_dequeue(MessageQueue *q, char **out_msg, int *out_sender) {
+    if (sem_wait(&q->items) != 0) return -1;
+    pthread_mutex_lock(&q->mutex);
+    if (q->shutdown && q->head == q->tail) {
+        pthread_mutex_unlock(&q->mutex);
+        sem_post(&q->items);
+        return -1;
+    }
+    *out_msg = q->buf[q->head];
+    *out_sender = q->sender[q->head];
+    q->head = (q->head + 1) % MSG_QUEUE_SIZE;
+    pthread_mutex_unlock(&q->mutex);
+    sem_post(&q->slots);
+    return 0;
+}
+
+/* Ativa o modo de desligamento da fila */
+void msgqueue_shutdown(MessageQueue *q) {
+    pthread_mutex_lock(&q->mutex);
+    q->shutdown = 1;
+    pthread_mutex_unlock(&q->mutex);
+    sem_post(&q->items);
+}
+
+/* --------------------------
+   Thread de broadcast
+   -------------------------- */
+void *broadcaster(void *arg) {
+    (void)arg;
+    while (1) {
+        char *msg = NULL;
+        int sender = -1;
+        int r = msgqueue_dequeue(&msg_queue, &msg, &sender);
+        if (r != 0) {
+            pthread_mutex_lock(&msg_queue.mutex);
+            int sd = msg_queue.shutdown;
+            pthread_mutex_unlock(&msg_queue.mutex);
+            if (sd) break;
+            else continue;
+        }
+
+        int count = 0;
+        int *sockets = clientlist_snapshot_sockets(&client_list, &count);
+        if (count > 0 && sockets != NULL) {
+            for (int i = 0; i < count; i++) {
+                int dst = sockets[i];
+                if (dst != sender) send(dst, msg, strlen(msg), 0);
+            }
+            free(sockets);
+        }
+        free(msg);
+    }
+    LOG_INFO(&logger, "Broadcaster finalizado");
+    return NULL;
+}
+
+/* --------------------------
+   Thread do cliente
+   -------------------------- */
 void *client_handler(void *arg) {
     client_t *cli = (client_t *)arg;
     char buffer[BUFFER_SIZE];
-    int bytes;
+    ssize_t bytes;
 
-    // Pede nome de usuário
-    char *prompt = "Digite seu nome de usuário: ";
+    const char *prompt = "Digite seu nome de usuÃ¡rio: ";
     send(cli->socket, prompt, strlen(prompt), 0);
 
-    // Recebe nome
     bytes = recv(cli->socket, buffer, sizeof(buffer) - 1, 0);
     if (bytes <= 0) {
-        remove_client(cli->socket);
+        clientlist_remove_by_sock(&client_list, cli->socket);
         pthread_exit(NULL);
     }
+
     buffer[bytes] = '\0';
-    
-    // Remove quebra de linha do nome
     size_t len = strlen(buffer);
-    if (len > 0 && buffer[len-1] == '\n') {
-        buffer[len-1] = '\0';
-    }
-    
-    // Salva nome (ou "Anonimo" se vazio)
+    if (len > 0 && buffer[len-1] == '\n') buffer[len-1] = '\0';
+
+
     if (strlen(buffer) == 0) {
         strncpy(cli->username, "Anonimo", sizeof(cli->username) - 1);
     } else {
         strncpy(cli->username, buffer, sizeof(cli->username) - 1);
     }
-    cli->username[sizeof(cli->username) - 1] = '\0';
+    cli->username[sizeof(cli->username)-1] = '\0';  
 
     LOG_INFO(&logger, "Novo cliente: %s (socket %d)", cli->username, cli->socket);
 
-    // Avisa que cliente entrou no chat
-    char welcome_msg[BUFFER_SIZE];
-    snprintf(welcome_msg, sizeof(welcome_msg), "--- %s entrou no chat ---\n", cli->username);
-    broadcast(welcome_msg, cli->socket);
+    char welcome[BUFFER_SIZE];
+    snprintf(welcome, sizeof(welcome), "--- %s entrou no chat ---\n", cli->username);
+    msgqueue_enqueue(&msg_queue, welcome, cli->socket);
 
-    // Loop principal: recebe mensagens do cliente
+    /* Recebe e encaminha mensagens */
     while ((bytes = recv(cli->socket, buffer, sizeof(buffer) - 1, 0)) > 0) {
         buffer[bytes] = '\0';
-        
-        // Log da mensagem (trunca se for muito longa)
-        if (strlen(buffer) > 50) {
-            char truncated[54];
-            strncpy(truncated, buffer, 50);
-            truncated[50] = '\0';
-            strcat(truncated, "...");
-            LOG_DEBUG(&logger, "Mensagem de %s: %s", cli->username, truncated);
+
+        /* verifica saÃ­da */
+        if (strcmp(buffer, "/quit\n") == 0 || strcmp(buffer, "/quit") == 0) {
+            break;
+        }
+
+        /* loga a mensagem recebida  */
+        if (strlen(buffer) > 100) {
+            char truncated[104];
+            strncpy(truncated, buffer, 100);
+            truncated[100] = '\0';
+            LOG_DEBUG(&logger, "Mensagem de %s (trunc): %s", cli->username, truncated);
         } else {
             LOG_DEBUG(&logger, "Mensagem de %s: %s", cli->username, buffer);
         }
 
-        // Verifica se quer sair
-        if (strcmp(buffer, "/quit\n") == 0) {
-            LOG_INFO(&logger, "Cliente %s saiu", cli->username);
+        /* prepara mensagem formatada e enfileira */
+        char formatted[BUFFER_SIZE];
+        /* garante que o buffer enviado contenha um '\n' ao final para o cliente receptor */
+        size_t mlen = strlen(buffer);
+        if (mlen > 0 && buffer[mlen-1] == '\n') {
+            snprintf(formatted, sizeof(formatted), "[%s] %s", cli->username, buffer);
+        } else {
+            snprintf(formatted, sizeof(formatted), "[%s] %s\n", cli->username, buffer);
+        }
+
+        if (msgqueue_enqueue(&msg_queue, formatted, cli->socket) != 0) {
+            LOG_WARN(&logger, "Fila cheia ou shutting down â€” descartando mensagem de %s", cli->username);
             break;
         }
-
-        // Formata mensagem com nome do usuário
-        char formatted_msg[BUFFER_SIZE];
-        char clean_msg[BUFFER_SIZE];
-        strncpy(clean_msg, buffer, sizeof(clean_msg) - 1);
-        clean_msg[sizeof(clean_msg) - 1] = '\0';
-        
-        // Remove quebra de linha
-        size_t msg_len = strlen(clean_msg);
-        if (msg_len > 0 && clean_msg[msg_len-1] == '\n') {
-            clean_msg[msg_len-1] = '\0';
-        }
-        
-        // Cria mensagem formatada: [nome] mensagem
-        snprintf(formatted_msg, sizeof(formatted_msg), "[%s] %s\n", cli->username, clean_msg);
-        
-        // Envia para todos os outros clientes
-        broadcast(formatted_msg, cli->socket);
     }
 
-    // Cliente desconectou ou teve erro
-    if (bytes == 0) {
-        LOG_INFO(&logger, "Cliente %s desconectou", cli->username);
-    } else if (bytes < 0) {
-        LOG_ERROR(&logger, "Erro com %s: %s", cli->username, strerror(errno));
-    }
-
-    // Avisa que cliente saiu do chat
+    /* Remove cliente ao sair */
     char leave_msg[BUFFER_SIZE];
     snprintf(leave_msg, sizeof(leave_msg), "--- %s saiu do chat ---\n", cli->username);
-    broadcast(leave_msg, cli->socket);
+    msgqueue_enqueue(&msg_queue, leave_msg, cli->socket);
 
-    remove_client(cli->socket);
+    clientlist_remove_by_sock(&client_list, cli->socket);
     pthread_exit(NULL);
 }
 
-// Função chamada quando aperta Ctrl+C
+/* --------------------------
+   Encerramento e limpeza
+   -------------------------- */
 void handle_sigint(int sig) {
-    LOG_WARN(&logger, "Recebido Ctrl+C, parando servidor...");
-    
-    // Fecha socket do servidor para sair do accept()
-    shutdown(server_fd, SHUT_RDWR);
+    (void)sig;
+    LOG_WARN(&logger, "Recebido SIGINT, iniciando shutdown...");
+    if (server_fd >= 0) shutdown(server_fd, SHUT_RDWR);
+    msgqueue_shutdown(&msg_queue);
 }
 
-// Limpa tudo antes de sair
+/* Libera todos os recursos e encerra o servidor */
 void cleanup_server() {
-    LOG_WARN(&logger, "Limpando recursos...");
-
-    // Fecha todos os clientes conectados
-    pthread_mutex_lock(&clients_mutex);
+    LOG_INFO(&logger, "Iniciando cleanup...");
+    msgqueue_shutdown(&msg_queue);
+    pthread_join(broadcaster_tid, NULL);
+    pthread_mutex_lock(&client_list.mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i]) {
-            LOG_INFO(&logger, "Desconectando %s", clients[i]->username);
-            shutdown(clients[i]->socket, SHUT_RDWR);
-            close(clients[i]->socket);
-            free(clients[i]);
-            clients[i] = NULL;
+        if (client_list.clients[i]) {
+            shutdown(client_list.clients[i]->socket, SHUT_RDWR);
+            close(client_list.clients[i]->socket);
         }
     }
-    pthread_mutex_unlock(&clients_mutex);
-
-    // Fecha socket do servidor
-    if (server_fd >= 0) {
-        close(server_fd);
-    }
-
+    pthread_mutex_unlock(&client_list.mutex);
+    clientlist_wait_until_empty(&client_list);
+    msgqueue_destroy(&msg_queue);
+    pthread_mutex_destroy(&client_list.mutex);
+    pthread_cond_destroy(&client_list.cond);
+    LOG_INFO(&logger, "Cleanup finalizado");
     log_close(&logger);
-    LOG_INFO(&logger, "Servidor parado");
 }
 
+/* --------------------------
+   FunÃ§Ã£o principal
+   -------------------------- */
 int main() {
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len;
 
-    // Configura tratamento do Ctrl+C
     signal(SIGINT, handle_sigint);
-
-    // Inicializa sistema de logs
     log_init(&logger, LOG_DEBUG);
+    LOG_INFO(&logger, "Iniciando servidor ...");
 
-    LOG_INFO(&logger, "Iniciando servidor de chat...");
+    clientlist_init(&client_list);
+    msgqueue_init(&msg_queue);
+    sem_init(&client_slots, 0, MAX_CLIENTS);
 
-    // Cria socket do servidor
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        LOG_ERROR(&logger, "Erro ao criar socket: %s", strerror(errno));
-        exit(EXIT_FAILURE);
-    }
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) exit(EXIT_FAILURE);
 
-    // Permite reusar a porta rapidamente
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // Configura endereço do servidor
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;  // Aceita de qualquer IP
+    server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
 
-    // Associa socket ao endereço
-    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        LOG_ERROR(&logger, "Erro no bind: %s", strerror(errno));
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    // Coloca socket em modo escuta
-    if (listen(server_fd, MAX_CLIENTS) < 0) {
-        LOG_ERROR(&logger, "Erro no listen: %s", strerror(errno));
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) exit(EXIT_FAILURE);
+    if (listen(server_fd, MAX_CLIENTS) < 0) exit(EXIT_FAILURE);
     LOG_INFO(&logger, "Servidor rodando na porta %d", PORT);
-    LOG_INFO(&logger, "Aguardando conexões...");
 
-    // Inicializa array de clientes como vazio
-    memset(clients, 0, sizeof(clients));
-
-    // Loop principal: aceita novas conexões
+    pthread_create(&broadcaster_tid, NULL, broadcaster, NULL);
+    
+    
+    /* Aceita novas conexÃµes e cria threads para cada cliente */
     while (1) {
-        client_len = sizeof(client_addr);
-        int new_sock = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+    client_len = sizeof(client_addr);
+    int new_sock = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
 
-        if (new_sock < 0) {
-            // Ignora erros se foi por causa do Ctrl+C
-            if (errno != EINTR) {
-                LOG_ERROR(&logger, "Erro ao aceitar conexão: %s", strerror(errno));
-            }
+    if (new_sock < 0) {
+        if (errno == EINTR) {  // interrupÃ§Ã£o por sinal (Ctrl+C)
+            break;
+        } else if (errno == EBADF || errno == EINVAL) {
+            // socket fechado pelo shutdown()
+            LOG_INFO(&logger, "Socket principal encerrado, saindo do loop accept().");
+            break;
+        } else {
+            LOG_ERROR(&logger, "Erro no accept: %s", strerror(errno));
             continue;
         }
-
-        // Cria estrutura para novo cliente
-        client_t *cli = malloc(sizeof(client_t));
-        if (!cli) {
-            LOG_ERROR(&logger, "Erro de memória");
+    }
+        if (sem_trywait(&client_slots) != 0) {
+            const char *busy = "Servidor cheio. Tente novamente mais tarde.\n";
+            send(new_sock, busy, strlen(busy), 0);
             close(new_sock);
             continue;
         }
 
+        client_t *cli = malloc(sizeof(client_t));
         cli->socket = new_sock;
         cli->addr = client_addr;
         cli->active = 1;
+        cli->username[0] = '\0';
 
-        // Adiciona cliente na primeira posição vazia
-        pthread_mutex_lock(&clients_mutex);
-        int added = 0;
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (!clients[i]) {
-                clients[i] = cli;
-                added = 1;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&clients_mutex);
-
-        if (!added) {
-            // Servidor cheio - rejeita cliente
-            LOG_WARN(&logger, "Servidor cheio! Rejeitando cliente.");
+        if (!clientlist_add(&client_list, cli)) {
             close(new_sock);
             free(cli);
+            sem_post(&client_slots);
             continue;
         }
 
-        // Cria thread para cuidar do cliente
-        if (pthread_create(&cli->thread_id, NULL, client_handler, (void *)cli) != 0) {
-            LOG_ERROR(&logger, "Erro ao criar thread");
-            remove_client(new_sock);
-            continue;
-        }
-
-        // Não precisa esperar thread terminar
+        pthread_create(&cli->thread_id, NULL, client_handler, (void *)cli);
         pthread_detach(cli->thread_id);
-        
-        LOG_INFO(&logger, "Cliente aceito. Total: %d", added);
     }
 
     cleanup_server();
