@@ -11,15 +11,15 @@
 #define PORT 8080
 #define BUFFER_SIZE 1024
 
-// Vari·veis globais
-volatile sig_atomic_t client_running = 1;  // Controla se cliente est· ativo
-int sock = -1;                             // Socket de conex„o
+// Vari√°veis globais
+volatile sig_atomic_t client_running = 1;  // Controla se cliente est√° ativo
+int sock = -1;                             // Socket de conex√£o
 
-// FunÁ„o chamada quando aperta Ctrl+C
+// Fun√ß√£o chamada quando aperta Ctrl+C
 void handle_sigint(int sig) {
     client_running = 0;                    // Marca para parar
     if (sock >= 0) {
-        shutdown(sock, SHUT_RDWR);         // Fecha conex„o
+        shutdown(sock, SHUT_RDWR);         // Fecha conex√£o
     }
 }
 
@@ -27,20 +27,25 @@ void handle_sigint(int sig) {
 void *receive_handler(void *arg) {
     char buffer[BUFFER_SIZE];
     int bytes;
-    
-    // Fica recebendo mensagens enquanto estiver conectado
+
     while (client_running && (bytes = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
-        buffer[bytes] = '\0';              // Termina a string
-        printf("%s", buffer);              // Mostra mensagem
-        fflush(stdout);                    // ForÁa exibiÁ„o imediata
+        buffer[bytes] = '\0';  // Garante termina√ß√£o da string
+
+        // Divide as mensagens recebidas pelo caractere '\n'
+        char *token = strtok(buffer, "\n");
+        while (token != NULL) {
+            printf("%s\n", token);  // Mostra cada mensagem separada
+            fflush(stdout);         // For√ßa exibi√ß√£o imediata (importante no CLI)
+            token = strtok(NULL, "\n");
+        }
     }
-    
-    // Servidor caiu ou erro
+
+    // Caso o servidor feche a conex√£o ou ocorra erro
     if (bytes <= 0 && client_running) {
-        printf("\n--- Conex„o com o servidor perdida ---\n");
-        client_running = 0;                // Para o cliente
+        printf("\n--- Conex√£o com o servidor perdida ---\n");
+        client_running = 0;
     }
-    
+
     return NULL;
 }
 
@@ -59,13 +64,13 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // Configura endereÁo do servidor
+    // Configura endere√ßo do servidor
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
     
-    // Converte IP de texto para bin·rio
+    // Converte IP de texto para bin√°rio
     if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0) {
-        perror("EndereÁo inv·lido");
+        perror("Endere√ßo inv√°lido");
         close(sock);
         exit(EXIT_FAILURE);
     }
@@ -73,7 +78,7 @@ int main() {
     // Conecta ao servidor
     printf("Conectando ao servidor...\n");
     if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Falha na conex„o");
+        perror("Falha na conex√£o");
         close(sock);
         exit(EXIT_FAILURE);
     }
@@ -88,7 +93,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // Loop principal: lÍ mensagens do usu·rio e envia
+    // Loop principal: l√™ mensagens do usu√°rio e envia
     while (client_running && fgets(msg, sizeof(msg), stdin) != NULL) {
         if (!client_running) break;
         
@@ -98,7 +103,7 @@ int main() {
             msg[len-1] = '\0';
         }
         
-        // Verifica se È comando de saÌda
+        // Verifica se √© comando de sa√≠da
         if (strcmp(msg, "/quit") == 0) {
             // Envia /quit com enter para o servidor
             strcat(msg, "\n");
@@ -125,7 +130,7 @@ int main() {
     client_running = 0;
     printf("Desconectando...\n");
     
-    // Fecha conex„o
+    // Fecha conex√£o
     if (sock >= 0) {
         shutdown(sock, SHUT_RDWR);
         close(sock);
