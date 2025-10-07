@@ -140,19 +140,7 @@ Para simular múltiplos clientes conectando e enviando mensagens:
 
 bash Script_teste_server.sh
 
- Arquitetura Geral
 
-O servidor segue o modelo:
-
-Cliente (CLI) <--TCP--> Servidor Principal
-                          ├── Thread Broadcaster
-                          ├── Thread Cliente 1
-                          ├── Thread Cliente 2
-                          └── ...
-
-
-Cada cliente possui sua thread dedicada.
-As mensagens são colocadas em uma fila protegida (monitor) e consumidas pelo broadcaster, que as envia para todos os clientes conectados.
 
  Conclusão
 
