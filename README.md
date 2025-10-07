@@ -34,7 +34,7 @@ O sistema é composto pelos seguintes módulos:
 | **Makefile** | Arquivo de build para compilar e gerar os executáveis `servidor` e `cliente`. |
 | **Script_teste_server.sh** | Script automatizado para simular múltiplos clientes conectando e trocando mensagens. |
 | **DiagramaSequenciaServerCliente.txt** | Documento com diagramas de sequência explicando a comunicação entre cliente e servidor em diferentes fases. |
-| **Analise_Critica_Servidor_Multithread.pdf** | Relatório de análise crítica do código, com detecção e discussão de possíveis *race conditions*, *deadlocks* e sugestões de melhoria. |
+| **Analise_Critica_Servidor_Multithread.pdf** | Relatório de análise crítica do código feita com IA, com detecção e discussão de possíveis *race conditions*, *deadlocks* e sugestões de melhoria. |
 
 ---
 
