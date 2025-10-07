@@ -2,8 +2,8 @@
 
 # Configurações
 NUM_CLIENTS=3
-CLIENT_EXEC="./client"
-SERVER_EXEC="./server"
+CLIENT_EXEC="./cliente"
+SERVER_EXEC="./servidor"
 RUN_TIME=15   # tempo total do teste em segundos
 
 # Função para encerrar todos os processos ao sair
